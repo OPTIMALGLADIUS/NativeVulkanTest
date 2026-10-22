@@ -5,12 +5,13 @@
 #include <vulkan/vulkan.h>
 
 #include <atomic>
-#include <thread>
+#include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <algorithm>
-#include <cstdint>
+#include <limits>
 
 #define LOG_TAG "NativeVulkan"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -20,49 +21,76 @@ namespace {
 
 std::thread renderThread;
 std::atomic<bool> running{false};
+std::atomic<uint64_t> presentedFrames{0};
+
 std::mutex lifecycleMutex;
+std::mutex statusMutex;
+
+std::string rendererStatus = "Renderer not started";
+
+void setRendererStatus(const std::string& message) {
+    std::lock_guard<std::mutex> lock(statusMutex);
+    rendererStatus = message;
+    LOGI("%s", message.c_str());
+}
+
+std::string getStatusSnapshot() {
+    std::lock_guard<std::mutex> lock(statusMutex);
+    return rendererStatus;
+}
 
 void logVk(const char* operation, VkResult result) {
-    if (result != VK_SUCCESS) {
-        LOGE("%s failed: VkResult=%d", operation, result);
-    }
+    LOGE("%s failed: VkResult=%d", operation,
+         static_cast<int>(result));
 }
 
 bool hasInstanceExtension(const char* name) {
     uint32_t count = 0;
+
     if (vkEnumerateInstanceExtensionProperties(
             nullptr, &count, nullptr) != VK_SUCCESS) {
         return false;
     }
 
     std::vector<VkExtensionProperties> extensions(count);
+
     if (vkEnumerateInstanceExtensionProperties(
             nullptr, &count, extensions.data()) != VK_SUCCESS) {
         return false;
     }
 
     for (const auto& ext : extensions) {
-        if (std::string(ext.extensionName) == name) return true;
+        if (std::string(ext.extensionName) == name) {
+            return true;
+        }
     }
+
     return false;
 }
 
-bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
+bool hasDeviceExtension(
+        VkPhysicalDevice device,
+        const char* name) {
     uint32_t count = 0;
+
     if (vkEnumerateDeviceExtensionProperties(
             device, nullptr, &count, nullptr) != VK_SUCCESS) {
         return false;
     }
 
     std::vector<VkExtensionProperties> extensions(count);
+
     if (vkEnumerateDeviceExtensionProperties(
             device, nullptr, &count, extensions.data()) != VK_SUCCESS) {
         return false;
     }
 
     for (const auto& ext : extensions) {
-        if (std::string(ext.extensionName) == name) return true;
+        if (std::string(ext.extensionName) == name) {
+            return true;
+        }
     }
+
     return false;
 }
 
@@ -78,26 +106,62 @@ void renderLoop(ANativeWindow* window) {
     VkFence frameFence = VK_NULL_HANDLE;
 
     auto cleanup = [&]() {
-        if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
-        if (frameFence) vkDestroyFence(device, frameFence, nullptr);
-        if (imageAvailable)
+        if (device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(device);
+        }
+
+        if (frameFence != VK_NULL_HANDLE) {
+            vkDestroyFence(device, frameFence, nullptr);
+        }
+
+        if (imageAvailable != VK_NULL_HANDLE) {
             vkDestroySemaphore(device, imageAvailable, nullptr);
-        if (renderFinished)
+        }
+
+        if (renderFinished != VK_NULL_HANDLE) {
             vkDestroySemaphore(device, renderFinished, nullptr);
-        if (commandPool)
+        }
+
+        if (commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(device, commandPool, nullptr);
-        if (swapchain)
+        }
+
+        if (swapchain != VK_NULL_HANDLE) {
             vkDestroySwapchainKHR(device, swapchain, nullptr);
-        if (device) vkDestroyDevice(device, nullptr);
-        if (surface) vkDestroySurfaceKHR(instance, surface, nullptr);
-        if (instance) vkDestroyInstance(instance, nullptr);
-        if (window) ANativeWindow_release(window);
+        }
+
+        if (device != VK_NULL_HANDLE) {
+            vkDestroyDevice(device, nullptr);
+        }
+
+        if (surface != VK_NULL_HANDLE) {
+            vkDestroySurfaceKHR(instance, surface, nullptr);
+        }
+
+        if (instance != VK_NULL_HANDLE) {
+            vkDestroyInstance(instance, nullptr);
+        }
+
+        if (window != nullptr) {
+            ANativeWindow_release(window);
+        }
     };
 
-    if (!hasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME) ||
-        !hasInstanceExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
-        LOGE("Required Vulkan surface extensions are unavailable.");
+    auto fail = [&](const std::string& message) {
+        setRendererStatus("ERROR: " + message);
         cleanup();
+    };
+
+    setRendererStatus("Checking Vulkan surface extensions...");
+
+    if (!hasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
+        fail("VK_KHR_surface is unavailable.");
+        return;
+    }
+
+    if (!hasInstanceExtension(
+            VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
+        fail("VK_KHR_android_surface is unavailable.");
         return;
     }
 
@@ -125,11 +189,14 @@ void renderLoop(ANativeWindow* window) {
     VkResult result = vkCreateInstance(
         &instanceInfo, nullptr, &instance
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateInstance", result);
-        cleanup();
+        fail("vkCreateInstance failed: VkResult=" +
+             std::to_string(static_cast<int>(result)));
         return;
     }
+
+    setRendererStatus("Vulkan instance: SUCCESS");
 
     VkAndroidSurfaceCreateInfoKHR surfaceInfo{
         VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR
@@ -139,26 +206,35 @@ void renderLoop(ANativeWindow* window) {
     result = vkCreateAndroidSurfaceKHR(
         instance, &surfaceInfo, nullptr, &surface
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateAndroidSurfaceKHR", result);
-        cleanup();
+        fail("Android surface creation failed: VkResult=" +
+             std::to_string(static_cast<int>(result)));
         return;
     }
+
+    setRendererStatus("Android surface: SUCCESS");
 
     uint32_t physicalCount = 0;
     result = vkEnumeratePhysicalDevices(
         instance, &physicalCount, nullptr
     );
+
     if (result != VK_SUCCESS || physicalCount == 0) {
-        LOGE("No Vulkan physical devices found.");
-        cleanup();
+        fail("No Vulkan physical devices found.");
         return;
     }
 
     std::vector<VkPhysicalDevice> physicalDevices(physicalCount);
-    vkEnumeratePhysicalDevices(
+
+    result = vkEnumeratePhysicalDevices(
         instance, &physicalCount, physicalDevices.data()
     );
+
+    if (result != VK_SUCCESS) {
+        fail("Physical-device enumeration failed.");
+        return;
+    }
 
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     uint32_t graphicsFamily = UINT32_MAX;
@@ -173,38 +249,48 @@ void renderLoop(ANativeWindow* window) {
         vkGetPhysicalDeviceQueueFamilyProperties(
             candidate, &familyCount, nullptr
         );
+
         std::vector<VkQueueFamilyProperties> families(familyCount);
+
         vkGetPhysicalDeviceQueueFamilyProperties(
             candidate, &familyCount, families.data()
         );
 
         for (uint32_t i = 0; i < familyCount; ++i) {
             VkBool32 canPresent = VK_FALSE;
-            vkGetPhysicalDeviceSurfaceSupportKHR(
+
+            result = vkGetPhysicalDeviceSurfaceSupportKHR(
                 candidate, i, surface, &canPresent
             );
 
-            if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                canPresent) {
+            if (result == VK_SUCCESS &&
+                canPresent == VK_TRUE &&
+                (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
                 physicalDevice = candidate;
                 graphicsFamily = i;
                 break;
             }
         }
-        if (physicalDevice != VK_NULL_HANDLE) break;
+
+        if (physicalDevice != VK_NULL_HANDLE) {
+            break;
+        }
     }
 
     if (physicalDevice == VK_NULL_HANDLE) {
-        LOGE("No graphics queue supporting presentation was found.");
-        cleanup();
+        fail("No graphics queue supports surface presentation.");
         return;
     }
 
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-    LOGI("Selected GPU: %s", properties.deviceName);
+
+    const std::string gpuName = properties.deviceName;
+
+    setRendererStatus("GPU selected: " + gpuName);
 
     const float priority = 1.0f;
+
     VkDeviceQueueCreateInfo queueInfo{
         VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
     };
@@ -227,77 +313,95 @@ void renderLoop(ANativeWindow* window) {
     result = vkCreateDevice(
         physicalDevice, &deviceInfo, nullptr, &device
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateDevice", result);
-        cleanup();
+        fail("Logical-device creation failed: VkResult=" +
+             std::to_string(static_cast<int>(result)));
         return;
     }
 
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(device, graphicsFamily, 0, &queue);
 
+    setRendererStatus("Logical device: SUCCESS\nGPU: " + gpuName);
+
     VkSurfaceCapabilitiesKHR capabilities{};
+
     result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
         physicalDevice, surface, &capabilities
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", result);
-        cleanup();
+        fail("Surface capabilities query failed.");
         return;
     }
 
     if (!(capabilities.supportedUsageFlags &
           VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-        LOGE("Swapchain images do not support transfer-destination usage.");
-        cleanup();
+        fail("Swapchain images do not support transfer-destination usage.");
         return;
     }
 
     uint32_t formatCount = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(
+
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(
         physicalDevice, surface, &formatCount, nullptr
     );
-    if (formatCount == 0) {
-        LOGE("No surface formats available.");
-        cleanup();
+
+    if (result != VK_SUCCESS || formatCount == 0) {
+        fail("No Vulkan surface formats are available.");
         return;
     }
 
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(
+
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(
         physicalDevice, surface, &formatCount, formats.data()
     );
 
+    if (result != VK_SUCCESS) {
+        fail("Could not retrieve surface formats.");
+        return;
+    }
+
     VkSurfaceFormatKHR chosenFormat = formats[0];
+
     for (const auto& format : formats) {
         if (format.format == VK_FORMAT_R8G8B8A8_UNORM) {
             chosenFormat = format;
             break;
         }
+
         if (format.format == VK_FORMAT_B8G8R8A8_UNORM) {
             chosenFormat = format;
         }
     }
 
     VkExtent2D extent = capabilities.currentExtent;
+
     if (extent.width == UINT32_MAX) {
-        extent.width = static_cast<uint32_t>(
-            std::max(1, ANativeWindow_getWidth(window))
+        const int width = std::max(
+            1, ANativeWindow_getWidth(window)
         );
-        extent.height = static_cast<uint32_t>(
-            std::max(1, ANativeWindow_getHeight(window))
+        const int height = std::max(
+            1, ANativeWindow_getHeight(window)
         );
+
         extent.width = std::clamp(
-            extent.width, capabilities.minImageExtent.width,
+            static_cast<uint32_t>(width),
+            capabilities.minImageExtent.width,
             capabilities.maxImageExtent.width
         );
+
         extent.height = std::clamp(
-            extent.height, capabilities.minImageExtent.height,
+            static_cast<uint32_t>(height),
+            capabilities.minImageExtent.height,
             capabilities.maxImageExtent.height
         );
     }
 
     uint32_t imageCount = capabilities.minImageCount + 1;
+
     if (capabilities.maxImageCount > 0 &&
         imageCount > capabilities.maxImageCount) {
         imageCount = capabilities.maxImageCount;
@@ -305,17 +409,27 @@ void renderLoop(ANativeWindow* window) {
 
     VkCompositeAlphaFlagBitsKHR compositeAlpha =
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+
     const VkCompositeAlphaFlagBitsKHR alphaModes[] = {
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
         VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
         VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR
     };
+
+    bool alphaFound = false;
+
     for (auto mode : alphaModes) {
         if (capabilities.supportedCompositeAlpha & mode) {
             compositeAlpha = mode;
+            alphaFound = true;
             break;
         }
+    }
+
+    if (!alphaFound) {
+        fail("No supported composite-alpha mode was found.");
+        return;
     }
 
     VkSwapchainCreateInfoKHR swapInfo{
@@ -337,20 +451,40 @@ void renderLoop(ANativeWindow* window) {
     result = vkCreateSwapchainKHR(
         device, &swapInfo, nullptr, &swapchain
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateSwapchainKHR", result);
-        cleanup();
+        fail("Swapchain creation failed: VkResult=" +
+             std::to_string(static_cast<int>(result)));
         return;
     }
 
+    setRendererStatus(
+        "Swapchain: SUCCESS\nGPU: " + gpuName +
+        "\nResolution: " + std::to_string(extent.width) +
+        " x " + std::to_string(extent.height)
+    );
+
     uint32_t swapImageCount = 0;
-    vkGetSwapchainImagesKHR(
+
+    result = vkGetSwapchainImagesKHR(
         device, swapchain, &swapImageCount, nullptr
     );
+
+    if (result != VK_SUCCESS || swapImageCount == 0) {
+        fail("Could not retrieve swapchain images.");
+        return;
+    }
+
     std::vector<VkImage> images(swapImageCount);
-    vkGetSwapchainImagesKHR(
+
+    result = vkGetSwapchainImagesKHR(
         device, swapchain, &swapImageCount, images.data()
     );
+
+    if (result != VK_SUCCESS) {
+        fail("Could not retrieve swapchain image handles.");
+        return;
+    }
 
     VkCommandPoolCreateInfo poolInfo{
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
@@ -361,9 +495,9 @@ void renderLoop(ANativeWindow* window) {
     result = vkCreateCommandPool(
         device, &poolInfo, nullptr, &commandPool
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateCommandPool", result);
-        cleanup();
+        fail("Command-pool creation failed.");
         return;
     }
 
@@ -377,21 +511,31 @@ void renderLoop(ANativeWindow* window) {
     result = vkAllocateCommandBuffers(
         device, &allocInfo, &commandBuffer
     );
+
     if (result != VK_SUCCESS) {
-        logVk("vkAllocateCommandBuffers", result);
-        cleanup();
+        fail("Command-buffer allocation failed.");
         return;
     }
 
     VkSemaphoreCreateInfo semaphoreInfo{
         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
     };
-    if (vkCreateSemaphore(
-            device, &semaphoreInfo, nullptr, &imageAvailable) != VK_SUCCESS ||
-        vkCreateSemaphore(
-            device, &semaphoreInfo, nullptr, &renderFinished) != VK_SUCCESS) {
-        LOGE("Failed to create semaphores.");
-        cleanup();
+
+    result = vkCreateSemaphore(
+        device, &semaphoreInfo, nullptr, &imageAvailable
+    );
+
+    if (result != VK_SUCCESS) {
+        fail("Image-available semaphore creation failed.");
+        return;
+    }
+
+    result = vkCreateSemaphore(
+        device, &semaphoreInfo, nullptr, &renderFinished
+    );
+
+    if (result != VK_SUCCESS) {
+        fail("Render-finished semaphore creation failed.");
         return;
     }
 
@@ -400,37 +544,80 @@ void renderLoop(ANativeWindow* window) {
     };
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    result = vkCreateFence(device, &fenceInfo, nullptr, &frameFence);
+    result = vkCreateFence(
+        device, &fenceInfo, nullptr, &frameFence
+    );
+
     if (result != VK_SUCCESS) {
-        logVk("vkCreateFence", result);
-        cleanup();
+        fail("Frame fence creation failed.");
         return;
     }
 
-    LOGI("Swapchain created: %ux%u, %u images",
-         extent.width, extent.height, swapImageCount);
+    setRendererStatus(
+        "Renderer ready\nGPU: " + gpuName +
+        "\nSwapchain: SUCCESS\nWaiting for first frame..."
+    );
 
     while (running.load()) {
-        vkWaitForFences(device, 1, &frameFence, VK_TRUE, UINT64_MAX);
-
-        uint32_t imageIndex = 0;
-        result = vkAcquireNextImageKHR(
-            device, swapchain, UINT64_MAX,
-            imageAvailable, VK_NULL_HANDLE, &imageIndex
+        result = vkWaitForFences(
+            device, 1, &frameFence, VK_TRUE, UINT64_MAX
         );
 
-        if (result == VK_ERROR_OUT_OF_DATE_KHR ||
-            result == VK_SUBOPTIMAL_KHR) {
-            LOGE("Swapchain needs recreation; stopping this render loop.");
-            break;
-        }
         if (result != VK_SUCCESS) {
-            logVk("vkAcquireNextImageKHR", result);
+            logVk("vkWaitForFences", result);
+            setRendererStatus("ERROR: Waiting for frame fence failed.");
             break;
         }
 
-        vkResetFences(device, 1, &frameFence);
-        vkResetCommandBuffer(commandBuffer, 0);
+        uint32_t imageIndex = 0;
+
+        // Timeout periodically so stop requests are not delayed indefinitely.
+        result = vkAcquireNextImageKHR(
+            device,
+            swapchain,
+            1000000000ULL,
+            imageAvailable,
+            VK_NULL_HANDLE,
+            &imageIndex
+        );
+
+        if (result == VK_TIMEOUT || result == VK_NOT_READY) {
+            continue;
+        }
+
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            setRendererStatus(
+                "Swapchain out of date. Surface recreation is needed."
+            );
+            break;
+        }
+
+        if (result != VK_SUCCESS &&
+            result != VK_SUBOPTIMAL_KHR) {
+            logVk("vkAcquireNextImageKHR", result);
+            setRendererStatus(
+                "ERROR: Image acquisition failed: VkResult=" +
+                std::to_string(static_cast<int>(result))
+            );
+            break;
+        }
+
+        const bool acquireSuboptimal =
+            result == VK_SUBOPTIMAL_KHR;
+
+        result = vkResetFences(device, 1, &frameFence);
+
+        if (result != VK_SUCCESS) {
+            setRendererStatus("ERROR: Could not reset frame fence.");
+            break;
+        }
+
+        result = vkResetCommandBuffer(commandBuffer, 0);
+
+        if (result != VK_SUCCESS) {
+            setRendererStatus("ERROR: Could not reset command buffer.");
+            break;
+        }
 
         VkCommandBufferBeginInfo beginInfo{
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
@@ -438,8 +625,9 @@ void renderLoop(ANativeWindow* window) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
         result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
         if (result != VK_SUCCESS) {
-            logVk("vkBeginCommandBuffer", result);
+            setRendererStatus("ERROR: Could not begin command buffer.");
             break;
         }
 
@@ -453,7 +641,8 @@ void renderLoop(ANativeWindow* window) {
         toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = images[imageIndex];
-        toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toTransfer.subresourceRange.aspectMask =
+            VK_IMAGE_ASPECT_COLOR_BIT;
         toTransfer.subresourceRange.baseMipLevel = 0;
         toTransfer.subresourceRange.levelCount = 1;
         toTransfer.subresourceRange.baseArrayLayer = 0;
@@ -463,7 +652,10 @@ void renderLoop(ANativeWindow* window) {
             commandBuffer,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toTransfer
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &toTransfer
         );
 
         VkClearColorValue clearColor{};
@@ -480,9 +672,12 @@ void renderLoop(ANativeWindow* window) {
         range.layerCount = 1;
 
         vkCmdClearColorImage(
-            commandBuffer, images[imageIndex],
+            commandBuffer,
+            images[imageIndex],
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            &clearColor, 1, &range
+            &clearColor,
+            1,
+            &range
         );
 
         VkImageMemoryBarrier toPresent{
@@ -501,12 +696,16 @@ void renderLoop(ANativeWindow* window) {
             commandBuffer,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toPresent
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &toPresent
         );
 
         result = vkEndCommandBuffer(commandBuffer);
+
         if (result != VK_SUCCESS) {
-            logVk("vkEndCommandBuffer", result);
+            setRendererStatus("ERROR: Could not finish command buffer.");
             break;
         }
 
@@ -527,8 +726,13 @@ void renderLoop(ANativeWindow* window) {
         result = vkQueueSubmit(
             queue, 1, &submitInfo, frameFence
         );
+
         if (result != VK_SUCCESS) {
             logVk("vkQueueSubmit", result);
+            setRendererStatus(
+                "ERROR: GPU submission failed: VkResult=" +
+                std::to_string(static_cast<int>(result))
+            );
             break;
         }
 
@@ -542,16 +746,53 @@ void renderLoop(ANativeWindow* window) {
         presentInfo.pImageIndices = &imageIndex;
 
         result = vkQueuePresentKHR(queue, &presentInfo);
-        if (result != VK_SUCCESS &&
-            result != VK_SUBOPTIMAL_KHR &&
-            result != VK_ERROR_OUT_OF_DATE_KHR) {
+
+        // This is intentionally conservative for the diagnostic version:
+        // wait until presentation has consumed its semaphore before reuse.
+        VkResult idleResult = vkQueueWaitIdle(queue);
+
+        if (idleResult != VK_SUCCESS) {
+            logVk("vkQueueWaitIdle", idleResult);
+            setRendererStatus("ERROR: Queue idle wait failed.");
+            break;
+        }
+
+        if (result == VK_SUCCESS ||
+            result == VK_SUBOPTIMAL_KHR) {
+            ++presentedFrames;
+
+            std::string message =
+                "Vulkan presentation: SUCCESS\nGPU: " + gpuName +
+                "\nResolution: " + std::to_string(extent.width) +
+                " x " + std::to_string(extent.height);
+
+            if (acquireSuboptimal ||
+                result == VK_SUBOPTIMAL_KHR) {
+                message += "\nWarning: swapchain is suboptimal.";
+            }
+
+            setRendererStatus(message);
+        } else if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            setRendererStatus(
+                "Swapchain out of date. Surface recreation is needed."
+            );
+            break;
+        } else {
             logVk("vkQueuePresentKHR", result);
+            setRendererStatus(
+                "ERROR: Presentation failed: VkResult=" +
+                std::to_string(static_cast<int>(result))
+            );
             break;
         }
     }
 
-    LOGI("Stopping Vulkan renderer.");
+    if (running.load()) {
+        running.store(false);
+    }
+
     cleanup();
+    LOGI("Vulkan renderer stopped.");
 }
 
 } // namespace
@@ -559,41 +800,79 @@ void renderLoop(ANativeWindow* window) {
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_dev_optimalgladius_nativevulkantest_MainActivity_startRendering(
-    JNIEnv* env, jobject /*thiz*/, jobject javaSurface
-) {
+        JNIEnv* env,
+        jobject /*thiz*/,
+        jobject javaSurface) {
+
     std::lock_guard<std::mutex> lock(lifecycleMutex);
 
     if (running.load()) {
-        return env->NewStringUTF("Vulkan renderer is already running.");
+        return env->NewStringUTF(
+            "Vulkan renderer is already running."
+        );
     }
 
-    ANativeWindow* window = ANativeWindow_fromSurface(env, javaSurface);
-    if (!window) {
-        return env->NewStringUTF("ERROR: Could not obtain Android native window.");
+    // Join a previous render thread if it has already exited.
+    if (renderThread.joinable()) {
+        renderThread.join();
+    }
+
+    presentedFrames.store(0);
+    setRendererStatus("Obtaining Android native window...");
+
+    ANativeWindow* window =
+        ANativeWindow_fromSurface(env, javaSurface);
+
+    if (window == nullptr) {
+        setRendererStatus(
+            "ERROR: Could not obtain Android native window."
+        );
+
+        return env->NewStringUTF(
+            "ERROR: Could not obtain Android native window."
+        );
     }
 
     running.store(true);
+
     renderThread = std::thread([window]() {
         renderLoop(window);
         running.store(false);
     });
 
     return env->NewStringUTF(
-        "Native Vulkan renderer started.\n"
-        "Look for the blue-grey test frame.\n"
-        "Check logcat if the screen remains unchanged."
+        "Native Vulkan renderer launched.\n"
+        "Renderer status is updating below."
     );
 }
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_dev_optimalgladius_nativevulkantest_MainActivity_stopRendering(
-    JNIEnv* /*env*/, jobject /*thiz*/
-) {
+        JNIEnv* /*env*/,
+        jobject /*thiz*/) {
+
     std::lock_guard<std::mutex> lock(lifecycleMutex);
+
     running.store(false);
 
     if (renderThread.joinable()) {
         renderThread.join();
     }
+
+    setRendererStatus("Renderer stopped.");
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_dev_optimalgladius_nativevulkantest_MainActivity_getRendererStatus(
+        JNIEnv* env,
+        jobject /*thiz*/) {
+
+    std::string message = getStatusSnapshot();
+
+    message += "\nFrames presented: ";
+    message += std::to_string(presentedFrames.load());
+
+    return env->NewStringUTF(message.c_str());
 }
